@@ -1,5 +1,5 @@
 # Cloudsecurity
-Setup Docker,Swarm and Test-Enviroment with Ansible.
+Setup Docker,Kubernetes and Test-Enviroment with Ansible.
 # Prerequisites
 - ssh root password less
 - network between master and worker
