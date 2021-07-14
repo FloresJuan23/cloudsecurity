@@ -1,0 +1,584 @@
+---
+- hosts: all
+  become: yes
+  tasks:
+  - name: Install packages that allow apt to be used over HTTPS
+    apt:
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg-agent
+      - software-properties-common
+
+  - name: Add an apt signing key for Docker
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+
+  - name: Add apt repository for stable version
+    apt_repository:
+      repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu xenial stable
+      state: present
+
+  - name: Install docker and its dependecies
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - docker-ce 
+      - docker-ce-cli 
+      - containerd.io
+
+  - name: Add user to docker group
+    user:
+      name: "{{ master_user }}"
+      group: docker
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    with_items:
+      - swap
+      - none
+
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+  - name: Add an apt signing key for Kubernetes
+    apt_key:
+      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      state: present
+
+  - name: Adding apt repository for Kubernetes
+    apt_repository:
+      repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+      state: present
+      filename: kubernetes.list
+
+  - name: Install Kubernetes binaries
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+        - kubelet 
+        - kubeadm 
+        - kubectl
+  - name: Initialize the Kubernetes cluster using kubeadm
+    command: "kubeadm init --pod-network-cidr=192.168.0.0/24 --apiserver-advertise-address={{ master_ip }}"
+  - name: Setup kubeconfig for user
+    command: "{{ item }}"
+    with_items:
+     - "mkdir -p /home/{{ master_user }}/.kube"
+     - "cp -i /etc/kubernetes/admin.conf /home/{{ master_user }}/.kube/config"
+     - "chown {{ master_user }}:{{ master_user }} /home/{{ master_user }}/.kube/config"
+  - name: command for run only master
+    shell: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+    become: false
+  - name: remove taint(hostname)
+    command: "kubectl taint nodes {{ master_hostname}}  node-role.kubernetes.io/master-"
+    become: false
+#section create and deploy kubernetes file
+  - name: Creates kubernetes directory
+    become: false
+    file:
+      path: "/home/{{ master_user }}/kubernetes"
+      state: directory
+  - name: Creating file secrets.yaml
+    become: false
+    copy:
+      dest: "/home/{{ master_user }}/kubernetes/secrets.yaml"
+      content: |
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: project-secrets
+        type: Opaque
+        data:
+          root-password: cGFzc3dvcmQ=
+  - name: create secrets.yaml
+    shell: kubectl create -f /home/{{ master_user }}/kubernetes/secrets.yaml
+    become: false
+  - name: Creating file mysql-pv.yaml
+    become: false
+    copy:
+      dest: "/home/{{ master_user }}/kubernetes/mysql-pv.yaml"
+      content: |
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata:
+          name: mysql-pv-volume
+          labels:
+            type: local
+        spec:
+          storageClassName: manual
+          capacity:
+            storage: 1Gi
+          accessModes:
+            - ReadWriteOnce
+          hostPath:
+            path: "/mnt/data"
+        ---
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: mysql-pv-claim
+        spec:
+          storageClassName: manual
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
+  - name: create mysql-pv.yaml
+    shell: kubectl create -f /home/{{ master_user }}/kubernetes/mysql-pv.yaml
+    become: false
+  - name: Creating file mysql-service.yaml
+    become: false
+    copy:
+      dest: "/home/{{ master_user }}/kubernetes/mysql-service.yaml"
+      content: |
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: mysql
+        spec:
+          ports:
+          - protocol: TCP
+            port: 3306
+            targetPort: 3306
+          selector:
+            app: mysql
+          #clusterIP: None
+  - name: create mysql-service.yaml
+    shell: kubectl create -f /home/{{ master_user }}/kubernetes/mysql-service.yaml
+    become: false
+  - name: Creating file mysql-deployment.yaml
+    become: false
+    copy:
+      dest: "/home/{{ master_user }}/kubernetes/mysql-deployment.yaml"
+      content: |
+        apiVersion: apps/v1 # for versions before 1.9.0 use apps/v1beta2
+        kind: Deployment
+        metadata:
+          name: mysql
+        spec:
+          selector:
+            matchLabels:
+              app: mysql
+          strategy:
+            type: Recreate
+          template:
+            metadata:
+              labels:
+                app: mysql
+            spec:
+              containers:
+              - image: mysql:5.7
+                name: mysql
+                env:
+                  # Use secret in real usage
+                - name: MYSQL_ROOT_PASSWORD
+                  #value: password
+                  valueFrom:
+                    secretKeyRef:
+                      name: project-secrets
+                      key: root-password
+                ports:
+                - containerPort: 3306
+                  name: mysql
+                volumeMounts:
+                - name: mysql-persistent-storage
+                  mountPath: /var/lib/mysql
+              volumes:
+              - name: mysql-persistent-storage
+                persistentVolumeClaim:
+                  claimName: mysql-pv-claim
+  - name: create mysql-deployment.yaml
+    shell: kubectl create -f /home/{{ master_user }}/kubernetes/mysql-deployment.yaml
+    become: false
+  - name: wait for my sql pods to come up
+    shell: kubectl get pods -o json
+    become: false
+    register: kubectl_get_pods
+    until: kubectl_get_pods.stdout|from_json|json_query('items[*].status.phase')|unique == ["Running"]
+    retries: 30
+    delay: 15
+  - name: Creating file phpmyadmin-service.yaml
+    become: false
+    copy:
+      dest: "/home/{{ master_user }}/kubernetes/phpmyadmin-service.yaml"
+      content: |
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: phpmyadmin-service
+        spec:
+          type: NodePort
+          selector:
+            app: phpmyadmin
+          ports:
+          - protocol: TCP
+            port: 80
+            targetPort: 80
+  - name: create phpmyadmin-service.yaml
+    shell: kubectl create -f /home/{{ master_user }}/kubernetes/phpmyadmin-service.yaml
+    become: false
+  - name: Creating file phpmyadmin-deployment.yaml
+    become: false
+    copy:
+      dest: "/home/{{ master_user }}/kubernetes/phpmyadmin-deployment.yaml"
+      content: |
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: phpmyadmin-deployment
+          labels:
+            app: phpmyadmin
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: phpmyadmin
+          template:
+            metadata:
+              labels:
+                app: phpmyadmin
+            spec:
+              containers:
+                - name: phpmyadmin
+                  image: phpmyadmin/phpmyadmin
+                  ports:
+                    - containerPort: 80
+                  env:
+                    - name: PMA_HOST
+                      value: mysql
+                    - name: PMA_PORT
+                      value: "3306"
+                    - name: MYSQL_ROOT_PASSWORD
+                      valueFrom:
+                        secretKeyRef:
+                          name: project-secrets
+                          key: root-password
+  - name: create phpmyadmin-deployment.yaml
+    shell: kubectl create -f /home/{{ master_user }}/kubernetes/phpmyadmin-deployment.yaml
+    become: false
+  - name: wait for my phpmyadmin pods to come up
+    shell: kubectl get pods -o json
+    become: false
+    register: kubectl_get_pods
+    until: kubectl_get_pods.stdout|from_json|json_query('items[*].status.phase')|unique == ["Running"]
+    retries: 30
+    delay: 15
+  - name: Creating file wordpress-pv.yaml
+    become: false
+    copy:
+      dest: "/home/{{ master_user }}/kubernetes/wordpress-pv.yaml"
+      content: |
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata:
+          name: wordpress-pv-volume
+          labels:
+            type: local
+        spec:
+          storageClassName: manual
+          capacity:
+            storage: 1Gi
+          accessModes:
+            - ReadWriteOnce
+          hostPath:
+            path: "/var/www/html"
+        ---
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: wordpress-pv-claim
+        spec:
+          storageClassName: manual
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
+  - name: create wordpress-pv.yaml
+    shell: kubectl create -f /home/{{ master_user }}/kubernetes/wordpress-pv.yaml
+    become: false
+  - name: Creating file wordpress-service.yaml
+    become: false
+    copy:
+      dest: "/home/{{ master_user }}/kubernetes/wordpress-service.yaml"
+      content: |
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: wordpress
+          labels:
+            app: wordpress
+        spec:
+          ports:
+            - port: 80
+          selector:
+            app: wordpress
+            tier: frontend
+          type: LoadBalancer
+  - name: create wordpress-service.yaml
+    shell: kubectl create -f /home/{{ master_user }}/kubernetes/wordpress-service.yaml
+    become: false
+  - name: Creating file wordpress-deployment.yaml
+    become: false
+    copy:
+      dest: "/home/{{ master_user }}/kubernetes/wordpress-deployment.yaml"
+      content: |
+        apiVersion: apps/v1 # for versions before 1.9.0 use apps/v1beta2
+        kind: Deployment
+        metadata:
+          name: wordpress
+          labels:
+            app: wordpress
+        spec:
+          selector:
+            matchLabels:
+              app: wordpress
+              tier: frontend
+          strategy:
+            type: Recreate
+          template:
+            metadata:
+              labels:
+                app: wordpress
+                tier: frontend
+            spec:
+              containers:
+              - image: wordpress:4.8-apache
+                name: wordpress
+                env:
+                - name: WORDPRESS_DB_HOST
+                  value: mysql
+                - name: WORDPRESS_DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: project-secrets
+                      key: root-password
+                ports:
+                - containerPort: 80
+                  name: wordpress
+                volumeMounts:
+                - name: wordpress-persistent-storage
+                  mountPath: /var/www/html
+              volumes:
+              - name: wordpress-persistent-storage
+                persistentVolumeClaim:
+                  claimName: wordpress-pv-claim
+  - name: create wordpress-deployment.yaml
+    shell: kubectl create -f /home/{{ master_user }}/kubernetes/wordpress-deployment.yaml
+    become: false
+  - name: wait for my wordpress pods to come up
+    shell: kubectl get pods -o json
+    become: false
+    register: kubectl_get_pods
+    until: kubectl_get_pods.stdout|from_json|json_query('items[*].status.phase')|unique == ["Running"]
+    retries: 30
+    delay: 15
+  - name: Creating file efk.yaml
+    become: false
+    copy:
+      dest: "/home/{{ master_user }}/kubernetes/efk.yaml"
+      content: |
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: fluentd
+          namespace: default
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata:
+          name: fluentd
+        rules:
+        - apiGroups:
+          - ""
+          resources:
+          - pods
+          - namespaces
+          verbs:
+          - get
+          - list
+          - watch
+        ---
+        kind: ClusterRoleBinding
+        apiVersion: rbac.authorization.k8s.io/v1
+        metadata:
+          name: fluentd
+        roleRef:
+          kind: ClusterRole
+          name: fluentd
+          apiGroup: rbac.authorization.k8s.io
+        subjects:
+        - kind: ServiceAccount
+          name: fluentd
+          namespace: default
+        ---
+        apiVersion: apps/v1
+        kind: DaemonSet
+        metadata:
+          name: fluentd
+          namespace: default
+          labels:
+            app: fluentd
+        spec:
+          selector:
+            matchLabels:
+              app: fluentd
+          template:
+            metadata:
+              labels:
+                app: fluentd
+            spec:
+              serviceAccount: fluentd
+              serviceAccountName: fluentd
+              tolerations:
+              - key: node-role.kubernetes.io/master
+                effect: NoSchedule
+              containers:
+              - name: fluentd
+                image: fluent/fluentd-kubernetes-daemonset:v1.4-debian-elasticsearch-1
+                env:
+                  - name:  FLUENT_ELASTICSEARCH_HOST
+                    value: "elasticsearch"
+                  - name:  FLUENT_ELASTICSEARCH_PORT
+                    value: "9200"
+                  - name: FLUENT_ELASTICSEARCH_SCHEME
+                    value: "http"
+                  - name: FLUENT_UID
+                    value: "0"
+                  - name: FLUENTD_SYSTEMD_CONF
+                    value: "disable"
+                  - name: FLUENTD_PROMETHEUS_CONF
+                    value: "disable"
+                volumeMounts:
+                - name: varlog
+                  mountPath: /var/log
+                - name: varlibdockercontainers
+                  mountPath: /var/lib/docker/containers
+                  readOnly: true
+              terminationGracePeriodSeconds: 30
+              volumes:
+              - name: varlog
+                hostPath:
+                  path: /var/log
+              - name: varlibdockercontainers
+                hostPath:
+                  path: /var/lib/docker/containers
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          labels:
+            app: elasticsearch
+          name: elasticsearch
+          namespace: default
+        spec:
+          selector:
+            matchLabels:
+              app: elasticsearch
+          template:
+            metadata:
+              labels:
+                app: elasticsearch
+            spec:
+              containers:
+              - image: elasticsearch:5
+                name: elasticsearch
+                env:
+                - name: ES_JAVA_OPTS
+                  value: "-Xms1g -Xmx1g"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          labels:
+            app: elasticsearch
+          name: elasticsearch
+          namespace: default
+        spec:
+          ports:
+          - port: 9200
+            protocol: TCP
+            targetPort: 9200
+          selector:
+            app: elasticsearch
+          type: ClusterIP
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          labels:
+            app: kibana
+          name: kibana
+          namespace: default
+        spec:
+          selector:
+            matchLabels:
+              app: kibana
+          template:
+            metadata:
+              labels:
+                app: kibana
+            spec:
+              containers:
+              - env:
+                - name: ELASTICSEARCH_URL
+                  value: http://elasticsearch:9200/
+                image: kibana:5
+                name: kibana
+                resources: {}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          labels:
+            app: kibana
+          name: kibana
+          namespace: default
+        spec:
+          ports:
+          - port: 5601
+            protocol: TCP
+            targetPort: 5601
+          selector:
+            app: kibana
+          type: NodePort
+  - name: create efk.yaml
+    shell: kubectl create -f /home/{{ master_user }}/kubernetes/efk.yaml
+    become: false
+  - name: wait for my efk pods to come up
+    shell: kubectl get pods -o json
+    become: false
+    register: kubectl_get_pods
+    until: kubectl_get_pods.stdout|from_json|json_query('items[*].status.phase')|unique == ["Running"]
+    retries: 30
+    delay: 15
+#create file for join
+  - name: Install sshpass
+    apt:
+      name: sshpass
+      state: present
+      update_cache: yes
+  - name: Generate join command
+    command: kubeadm token create --print-join-command
+    register: join_command
+
+  - name: Copy join command to local file
+    local_action: copy content="{{ join_command.stdout_lines[0] }}" dest="/home/{{ master_user }}/kubernetes/join-command.sh"
+
